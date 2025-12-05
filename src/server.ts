@@ -359,6 +359,18 @@ app.get('/test-error', (req: Request, res: Response) => {
   throw error; // This will be caught by error middleware
 });
 
+// Endpoint to simulate deployment error - runtime error that compiles fine
+// This simulates a common deployment issue where code compiles but fails at runtime
+app.get('/deploy-error', (_req: Request, _res: Response) => {
+  // Simulate a runtime error: trying to access a property on undefined
+  // This compiles fine but throws TypeError at runtime
+  const config: any = undefined;
+  const serviceName = config.service.name; // TypeError: Cannot read property 'name' of undefined
+  
+  // This line will never execute, but TypeScript doesn't know that
+  return { service: serviceName };
+});
+
 // Fallback to index.html for root.
 app.get('/', (_req: Request, res: Response) => {
   res.sendFile(path.join(publicDir, 'index.html'));
