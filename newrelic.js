@@ -1,5 +1,33 @@
 'use strict';
 
+const { execSync } = require('child_process');
+
+// Get version from git tags (priority order):
+// 1. APP_VERSION environment variable (can be set from git tags during deployment)
+// 2. Git tag via git describe (if in a git repository)
+// 3. package.json version (fallback)
+let appVersion = process.env.APP_VERSION;
+
+if (!appVersion) {
+  try {
+    // Try to get version from git tags
+    const gitTag = execSync('git describe --tags --always --dirty', {
+      cwd: __dirname,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    appVersion = gitTag.replace(/^v/, ''); // Remove 'v' prefix if present
+  } catch (e) {
+    // Git command failed, try package.json
+    try {
+      const packageJson = require('./package.json');
+      appVersion = packageJson.version || 'unknown';
+    } catch (err) {
+      appVersion = 'unknown';
+    }
+  }
+}
+
 /**
  * New Relic agent configuration.
  *
@@ -75,5 +103,21 @@ exports.config = {
       enabled: true,
     },
   },
+  /**
+   * Labels allow you to add custom metadata to your application in New Relic.
+   * These labels appear in the New Relic UI and can be used for filtering and grouping.
+   * 
+   * Version detection priority:
+   * 1. APP_VERSION environment variable (set from git tags during deployment)
+   * 2. Git tag via 'git describe --tags --always' (automatic if in git repo)
+   * 3. package.json version (fallback)
+   * 
+   * @env APP_VERSION - Application version from git tags (e.g., APP_VERSION=$(git describe --tags --always))
+   */
+  labels: {
+    version: appVersion,
+    environment: process.env.NODE_ENV || 'development',
+  },
 };
+
 

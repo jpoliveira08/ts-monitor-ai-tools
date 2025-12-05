@@ -10,7 +10,7 @@ import cors from 'cors';
 import path from 'path';
 import newrelic from 'newrelic';
 
-type ToolId = 'cursor' | 'coderabbit' | 'chatgpt' | 'claude' | 'copilot';
+type ToolId = 'cursor' | 'chatgpt' | 'claude';
 
 interface ToolStatus {
   id: ToolId;
@@ -21,6 +21,30 @@ interface ToolStatus {
   error?: string;
 }
 
+interface ToolConfig {
+  id: ToolId;
+  name: string;
+  statusUrl: string;
+}
+
+const toolConfigs: ToolConfig[] = [
+  {
+    id: 'chatgpt',
+    name: 'ChatGPT',
+    statusUrl: 'https://status.openai.com/api/v2/status.json',
+  },
+  {
+    id: 'claude',
+    name: 'Claude',
+    statusUrl: 'https://status.claude.com/api/v2/status.json',
+  },
+  {
+    id: 'cursor',
+    name: 'Cursor',
+    statusUrl: 'https://status.cursor.com/api/v2/status.json',
+  },
+];
+
 const app = express();
 const port = process.env.PORT || 4000;
 
@@ -30,129 +54,229 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(publicDir));
 
-// In-memory status store (for demo purposes).
-let tools: ToolStatus[] = [
-  {
-    id: 'cursor',
-    name: 'Cursor',
-    status: 'healthy',
-    lastChecked: new Date().toISOString(),
-    latencyMs: 120,
-  },
-  {
-    id: 'coderabbit',
-    name: 'CodeRabbit',
-    status: 'degraded',
-    lastChecked: new Date().toISOString(),
-    latencyMs: 450,
-    error: 'Slow responses from API',
-  },
-  {
-    id: 'chatgpt',
-    name: 'ChatGPT',
-    status: 'healthy',
-    lastChecked: new Date().toISOString(),
-    latencyMs: 200,
-  },
-  {
-    id: 'claude',
-    name: 'Claude',
-    status: 'healthy',
-    lastChecked: new Date().toISOString(),
-    latencyMs: 180,
-  },
-  {
-    id: 'copilot',
-    name: 'GitHub Copilot',
-    status: 'unknown',
-    lastChecked: new Date().toISOString(),
-    latencyMs: null,
-  },
-];
+// In-memory status store
+let tools: ToolStatus[] = toolConfigs.map((config) => ({
+  id: config.id,
+  name: config.name,
+  status: 'unknown' as const,
+  lastChecked: new Date().toISOString(),
+  latencyMs: null,
+}));
 
-// Simulate status changes every 60 seconds so the UI looks "alive".
-function randomizeStatuses() {
-  const statuses: ToolStatus['status'][] = ['healthy', 'degraded', 'down'];
-  tools = tools.map((t): ToolStatus => {
-    const status = statuses[Math.floor(Math.random() * statuses.length)] ?? 'unknown';
-    const latency =
-      status === 'down'
-        ? null
-        : Math.floor(100 + Math.random() * (status === 'degraded' ? 800 : 300));
+// Rate limiting: delay between checks (in ms) to avoid being blocked
+const CHECK_DELAY_MS = 2000; // 2 seconds between each tool check
+const CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes (instead of 60 seconds)
+const REQUEST_TIMEOUT_MS = 10000; // 10 second timeout per request
+const MAX_RETRIES = 2; // Retry failed checks up to 2 times
 
-    const updatedTool = {
-      ...t,
-      status,
-      latencyMs: latency,
-      lastChecked: new Date().toISOString(),
-      error:
-        status === 'down'
-          ? 'No response from service'
-          : status === 'degraded'
-          ? 'Elevated latency'
-          : undefined,
-    };
-
-    // Log to New Relic
-    newrelic.recordCustomEvent('ToolStatusUpdate', {
-      toolId: updatedTool.id,
-      toolName: updatedTool.name,
-      status: updatedTool.status,
-      latencyMs: updatedTool.latencyMs ?? 0,
-      hasError: !!updatedTool.error,
-    });
-
-    // Log status changes
-    if (t.status !== status) {
-      const logLevel = status === 'down' ? 'ERROR' : status === 'degraded' ? 'WARN' : 'INFO';
-      const logMessage = `Tool status changed: ${updatedTool.name} is now ${status}`;
-      
-      // Use console logging (picked up by New Relic application_logging)
-      if (status === 'down') {
-        console.error(logMessage, {
-          toolId: updatedTool.id,
-          toolName: updatedTool.name,
-          oldStatus: t.status,
-          newStatus: status,
-          latencyMs: updatedTool.latencyMs,
-        });
-      } else if (status === 'degraded') {
-        console.warn(logMessage, {
-          toolId: updatedTool.id,
-          toolName: updatedTool.name,
-          oldStatus: t.status,
-          newStatus: status,
-          latencyMs: updatedTool.latencyMs,
-        });
-      } else {
-        console.log(logMessage, {
-          toolId: updatedTool.id,
-          toolName: updatedTool.name,
-          oldStatus: t.status,
-          newStatus: status,
-          latencyMs: updatedTool.latencyMs,
-        });
-      }
-
-      // Report errors to New Relic Error Inbox when tools go down
-      if (status === 'down') {
-        const error = new Error(`Tool ${updatedTool.name} is down`);
-        error.name = 'ToolDownError';
-        newrelic.noticeError(error, {
-          toolId: updatedTool.id,
-          toolName: updatedTool.name,
-          previousStatus: t.status,
-          errorType: 'ToolDown',
-          latencyMs: updatedTool.latencyMs ?? 0,
-        });
-      }
-    }
-
-    return updatedTool;
-  });
+// Helper to sleep/delay
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-setInterval(randomizeStatuses, 60_000);
+// Check a single tool's status with retry logic
+async function checkToolStatus(config: ToolConfig, retryCount = 0): Promise<{
+  status: ToolStatus['status'];
+  latencyMs: number | null;
+  error?: string;
+}> {
+  const startTime = Date.now();
+  const url = config.statusUrl;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'AI-Tools-Monitor/1.0',
+        'Accept': 'application/json, text/html, */*',
+      },
+    });
+
+    clearTimeout(timeoutId);
+    const latencyMs = Date.now() - startTime;
+
+    // Parse JSON status API response
+    if (response.ok) {
+      try {
+        const data = await response.json();
+        
+        // StatusPage.io API format - check status indicator
+        const indicator = data.status?.indicator;
+        const description = data.status?.description || '';
+        
+        if (indicator === 'none') {
+          // All systems operational - check latency
+          return { status: latencyMs > 2000 ? 'degraded' : 'healthy', latencyMs };
+        } else if (indicator === 'minor') {
+          // Minor service outage
+          return { 
+            status: 'degraded', 
+            latencyMs, 
+            error: description || 'Minor service outage' 
+          };
+        } else if (indicator === 'major' || indicator === 'critical') {
+          // Major or critical issues
+          return { 
+            status: 'down', 
+            latencyMs, 
+            error: description || `Service status: ${indicator}` 
+          };
+        } else if (indicator === 'partial') {
+          // Partial outage
+          return { 
+            status: 'degraded', 
+            latencyMs, 
+            error: description || 'Partial outage detected' 
+          };
+        }
+        
+        // If indicator is not recognized but response is OK, treat as healthy
+        return { status: latencyMs > 2000 ? 'degraded' : 'healthy', latencyMs };
+      } catch (error) {
+        // If JSON parsing fails, log error and treat as unknown
+        return { 
+          status: 'unknown', 
+          latencyMs, 
+          error: 'Failed to parse status API response' 
+        };
+      }
+    } else if (response.status === 429) {
+      // Rate limited - mark as degraded instead of down
+      return {
+        status: 'degraded',
+        latencyMs,
+        error: 'Rate limited - too many requests',
+      };
+    } else if (response.status >= 500) {
+      return { status: 'down', latencyMs, error: `Server error: ${response.status}` };
+    } else {
+      return { status: 'down', latencyMs, error: `HTTP ${response.status}` };
+    }
+  } catch (error: unknown) {
+    const latencyMs = Date.now() - startTime;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    // Handle specific error types
+    let lastError: string;
+    if (errorMessage.includes('aborted') || errorMessage.includes('timeout')) {
+      lastError = 'Request timeout';
+    } else if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('ENOTFOUND')) {
+      lastError = 'Connection failed';
+    } else {
+      lastError = errorMessage;
+    }
+
+    // Retry with exponential backoff if we haven't exceeded max retries
+    if (retryCount < MAX_RETRIES) {
+      await delay(1000 * (retryCount + 1)); // Exponential backoff: 1s, 2s
+      return checkToolStatus(config, retryCount + 1);
+    }
+
+    // If we got rate limited, mark as degraded instead of down
+    if (lastError.includes('Rate limited') || lastError.includes('429')) {
+      return { status: 'degraded', latencyMs: null, error: lastError };
+    }
+
+    return { status: 'down', latencyMs: null, error: lastError };
+  }
+}
+
+// Check all tools sequentially with delays to avoid rate limiting
+async function checkAllToolsStatus() {
+  for (let i = 0; i < toolConfigs.length; i++) {
+    const config = toolConfigs[i];
+    const existingTool = tools.find((t) => t.id === config.id);
+
+    try {
+      const result = await checkToolStatus(config);
+      const oldStatus = existingTool?.status || 'unknown';
+
+      const updatedTool: ToolStatus = {
+        id: config.id,
+        name: config.name,
+        status: result.status,
+        lastChecked: new Date().toISOString(),
+        latencyMs: result.latencyMs,
+        error: result.error,
+      };
+
+      // Update the tool in the array
+      const toolIndex = tools.findIndex((t) => t.id === config.id);
+      if (toolIndex >= 0) {
+        tools[toolIndex] = updatedTool;
+      } else {
+        tools.push(updatedTool);
+      }
+
+      // Log to New Relic
+      newrelic.recordCustomEvent('ToolStatusUpdate', {
+        toolId: updatedTool.id,
+        toolName: updatedTool.name,
+        status: updatedTool.status,
+        latencyMs: updatedTool.latencyMs ?? 0,
+        hasError: !!updatedTool.error,
+      });
+
+      // Only log errors
+      if (result.status === 'down' || result.error) {
+        console.error(`Error checking ${updatedTool.name}:`, {
+          toolId: updatedTool.id,
+          toolName: updatedTool.name,
+          status: result.status,
+          error: result.error,
+          latencyMs: updatedTool.latencyMs,
+        });
+
+        // Report errors to New Relic Error Inbox when tools go down
+        if (result.status === 'down') {
+          const error = new Error(`Tool ${updatedTool.name} is down: ${updatedTool.error || 'Unknown error'}`);
+          error.name = 'ToolDownError';
+          newrelic.noticeError(error, {
+            toolId: updatedTool.id,
+            toolName: updatedTool.name,
+            previousStatus: oldStatus,
+            errorType: 'ToolDown',
+            latencyMs: updatedTool.latencyMs ?? 0,
+            errorMessage: updatedTool.error,
+          });
+        }
+      }
+
+      // Delay before checking next tool to avoid rate limiting
+      if (i < toolConfigs.length - 1) {
+        await delay(CHECK_DELAY_MS);
+      }
+    } catch (error) {
+      console.error(`Error checking ${config.name}:`, error);
+      // Update tool with error status
+      const toolIndex = tools.findIndex((t) => t.id === config.id);
+      if (toolIndex >= 0) {
+        tools[toolIndex] = {
+          ...tools[toolIndex],
+          status: 'unknown',
+          lastChecked: new Date().toISOString(),
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+      }
+    }
+  }
+}
+
+// Initial check on startup
+checkAllToolsStatus().catch((err) => {
+  console.error('Error during initial status check:', err);
+});
+
+// Periodic checks
+setInterval(() => {
+  checkAllToolsStatus().catch((err) => {
+    console.error('Error during periodic status check:', err);
+  });
+}, CHECK_INTERVAL_MS);
 
 app.get('/health', (_req: Request, res: Response) => {
   newrelic.recordCustomEvent('HealthCheck', {
